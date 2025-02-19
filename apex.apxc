@@ -1,0 +1,1347 @@
+/**
+    * This class is used to process web form data and generate it into HTML
+    * Forms can be passed in one at a time or bulkified to provide multiple localized versions of one or more forms at one time
+    *
+      * @Author Carl Thress (Perficient)
+    * @Date 08/2020
+    *
+    *
+    */
+   
+
+public with sharing class FormProcessor {
+
+    // basic SFDC field type to html input type mappings
+    public static final Map<String, String> fieldTypeMap = new Map<String,String>{
+        'currency' => 'number',
+        'date' => 'date',
+        'datetime' => 'datetime-local',
+        'double' => 'number',
+        'email' => 'email',
+        'integer' => 'number',
+        'long' => 'number',
+        'percent' => 'number',
+        'phone' => 'tel',
+        'string' => 'text',
+        'time' => 'time',
+        'url' => 'url'
+    };
+
+    // yes-no localization defaults (overridden by Form_Translation__c records if they exist)
+    public static final Map<String, FormProcessor.YesNo> yesNoMap = new Map<String, FormProcessor.YesNo>{ // values from Google Translate
+        'ar' => new FormProcessor.YesNo('نعم','لا'),                // Arabic (automatically renders RTL so 'no' appears to come before 'yes')
+        'zh' => new FormProcessor.YesNo('是','没有'),               // Chinese
+        'nl' => new FormProcessor.YesNo('Ja','Nee'),                // Dutch
+        'en' => new FormProcessor.YesNo('Yes','No'),                // English
+        'fr' => new FormProcessor.YesNo('Oui','Non'),               // French
+        'de' => new FormProcessor.YesNo('Ja','Nein'),               // German
+        'id' => new FormProcessor.YesNo('Iya','Tidak'),             // Indonesian
+        'it' => new FormProcessor.YesNo('Sì','No'),                 // Italian
+        'ja' => new FormProcessor.YesNo('はい','番号'),             // Japanese
+        'ko' => new FormProcessor.YesNo('예','아니'),               // Korean
+        'nb' => new FormProcessor.YesNo('Ja','Nei'),                // Norwegian
+        'pl' => new FormProcessor.YesNo('Tak','Nie'),               // Polish
+        'pt' => new FormProcessor.YesNo('Sim','Não'),               // Portuguese
+        'ru' => new FormProcessor.YesNo('да','Нет'),                // Russian
+        'es' => new FormProcessor.YesNo('Si','No'),                 // Spanish
+        'sv' => new FormProcessor.YesNo('Ja','Nej'),                // Swedish
+        'tr' => new FormProcessor.YesNo('Evet','Hayır'),           // Turkish
+        'zu' => new FormProcessor.YesNo('Yebo','Cha')               // Zulu
+    };
+
+    // base translations to grab for all forms
+    @TestVisible private static final String selectFieldBlankOption = 'Please Select';
+    @TestVisible private static final String defaultSubmitButtonText = 'Submit';
+    @TestVisible private static final String defaultPrefix = 'Default :: ';
+    private static final List<String> baseTranslations = new List<String>{
+        'Yes',
+        'No',
+        FormProcessor.defaultSubmitButtonText,
+        FormProcessor.selectFieldBlankOption
+    };
+
+    // state fields (handled differently than other fields by AEM)
+    private static final List<String> stateFields = new List<String>{
+        // 'Job_Site_State_Prov__c',
+        // 'Mailing_State_Province__c'
+    };
+
+    // Interaction__c fields whose JSON names don't match the standard ECRM naming convention
+    private static final Map<String, String> fieldNameExceptionMap = new Map<String,String>{
+        'Call_Center_ID__c' => 'callCenterID',
+        'Call_Center_Inquiry_ID__c' => 'callCenterInquiryID',
+        'Contact_for_Questions__c' => 'contactforQuestions',
+        'CurrencyIsoCode' => 'currency',
+        'Customer_ID__c' => 'customerID',
+        'CWM_State_or_Province__c' => 'cwmStateorProvince',
+        'Eloqua_Contact_ID__c' => 'eloquaContactID',
+        'Family_ID__c' => 'familyID',
+        'GACLIENTID__c' => 'GACLIENTID',
+        'GATRACKID__c' => 'GATRACKID',
+        'GAUSERID__c' => 'GAUSERID',
+        'Job_Site_Zip_or_Postal__c' => 'jobSiteZiporPostal',
+        'Level_of_Interest__c' => 'levelofInterest',
+        'Link_to_GA_and_or_GA_Score__c' => 'linktoGAAndOrGAScore',
+        'LP__c' => 'LP',
+        'Product_of_Interest_Text_Master__c' => 'productofInterestTextMaster',
+        'Product_of_Interest_Quantity__c' => 'productofInterestQuantity',
+        'Product_of_Interest_Text__c' => 'productofInterestText',
+        'RAQ_Redirect_Url__c' => 'raqRedirectURL',
+        'Rental_Dealer_ID__c' => 'rentalDealerID',
+        'Route_to_Dealer__c' => 'routetoDealer',
+        'SFMC_global_subscription__c' => 'sfmcglobalSubscription',
+        'System_Family_ID__c' => 'systemFamilyID',
+        'System_Model_ID__c' => 'systemModelID',
+        'System_Opt_in_for_eMail__c' => 'systemOptInForEmail',
+        'System_Opt_in_for_SMS__c' => 'systemOptInForSMS',
+        'System_Opt_in_for_Telephone__c' => 'systemOptinforTelephone',
+        'System_Sub_Family_ID__c' => 'systemSubfamilyID'
+    };
+
+    // hidden fields present only for ESRI-enabled forms
+    private static final List<String> esriOnlyFields = new List<String>{
+        'Latitude__c',
+        'Longitude__c'
+    };
+
+    private static Pattern languagePattern = Pattern.compile('^[a-z]{2}_[a-z]{2}__c$');
+
+    // subscription-based defaults (will be overriden by Form_Translation__c records if they exist)
+    public static final String subscriptionFieldName = 'System_Opt_in_for_eMail__c';
+    public static final String subscriptionTranslationRecordName = 'Marketing Opt-In Verbiage';
+    public static final String subscriptionTranslationRecordDefault = 'I would like to receive future marketing communications (such as email) ' +
+                                                                      'from Caterpillar Inc., its affiliates and subsidiaries worldwide and the ' +
+                                                                      'Cat dealer network. Regardless of whether you decide to receive these ' +
+                                                                      'marketing communications, Caterpillar will continue to send ' +
+                                                                      'service/transactional messages, including those that have to do ' +
+                                                                      'with any accounts that you may have with us.';
+
+    // the exception to throw when no form is found matching the criteria passed in
+    public static final String noFormForLanguage = 'Form not found for Name/Language';
+
+   
+    /*
+         * method called to bulk process all language-based versions of multiple forms
+         *
+         * @param - formNames
+         * a list of Form__c.Name strings to process
+         *
+         * @return - formsToReturn
+         * a map containing each passed-in formName with a corresponding map of languages and their HTML output
+         */
+    public static Map<String, Map<String, String>> processForms(List<String> formNames) {
+        Map<String, Map<String, String>> formsToReturn = new Map<String, Map<String, String>>();
+        Map<String, List<String>> formsToProcess = new Map<String, List<String>>();
+        try {
+            for(Form__c webForm : [SELECT Id, Name, Available_Languages__c FROM Form__c WHERE Name IN :formNames]){
+                List<String> languages = new List<String>();
+                if(String.isNotEmpty(webForm.Available_Languages__c)) {
+                    languages = webForm.Available_Languages__c.split(';');
+                } else {
+                    languages.add('en_US');
+                }
+                formsToProcess.put(webForm.Name, languages);
+            }
+        } catch(Exception e) {
+            System.debug(e.getMessage());
+            System.debug(e.getLineNumber());
+            throw new FormProcessor.FormProcessorException(noFormForLanguage);
+        }
+        try {
+            formsToReturn = processFormsForLanguages(formsToProcess);
+        } catch(Exception e) {
+            throw new FormProcessor.FormProcessorException(noFormForLanguage);
+        }
+        return formsToReturn;
+    }
+   
+    /*
+         * method called to bulk process all language-based versions of a single form
+         *
+         * @param - formName
+         * the Form__c.Name string to process
+         *
+         * @return - returnedForms
+         * a map of available languages and their HTML output
+         */
+    public static Map<String,String> processForm(String formName) {
+        Map<String, Map<String,String>> returnedForms = new Map<String, Map<String,String>>();
+        List<String> formNames = new List<String>{formName};
+        try {
+            Form__c webForm = [SELECT Id FROM Form__c WHERE Name = :formName];
+        } catch(Exception e) {
+            System.debug(e.getMessage());
+            System.debug(e.getLineNumber());
+            throw new FormProcessor.FormProcessorException(noFormForLanguage);
+        }
+        try {
+            returnedForms = processForms(formNames);
+        } catch(Exception e) {
+            throw new FormProcessor.FormProcessorException(noFormForLanguage);
+        }
+        return returnedForms.get(formName);
+    }
+
+    /*
+         * method called to process a single version of a single form
+         *
+         * @param - formName
+         * the Form__c.Name string to process
+         *
+         * @param - language
+         * the language to process (e.g. en_US)
+         *
+         * @return - processedForm
+         * a string containing the HTML to use for the form
+         */
+    public static string processForm(String formName, string language) {
+        List<String> languages = new List<String>{language};
+        Map<String, List<String>> formsToProcess = new Map<String, List<String>>{
+            formName => languages
+        };
+        Map<String, Map<String,String>> returnedForms = new Map<String, Map<String, String>>();
+        try {
+            Form__c webForm = [SELECT Id FROM Form__c WHERE Name = :formName AND Available_Languages__c INCLUDES(:language)];
+        } catch(Exception e) {
+            System.debug(e.getMessage());
+            System.debug(e.getLineNumber());
+            throw new FormProcessor.FormProcessorException(noFormForLanguage);
+        }
+        try {
+            returnedForms = processFormsForLanguages(formsToProcess);
+        } catch(Exception e) {
+            throw new FormProcessor.FormProcessorException(noFormForLanguage);
+        }
+        return returnedForms.get(formName).get(language);
+    }
+
+    /*
+         * private method called by each of the above methods to process the request and create the HTML
+         *
+         * @param - formsToProcess
+         * a map with form names as keys and lists of language values to process as their associated values
+         *
+         * @return - formsToReturn
+         * a map containing each passed-in formName with a corresponding map of their associated languages and their HTML output
+         */
+    private static Map<String, Map<String,String>> processFormsForLanguages(Map<String, List<String>> formsToProcess) {
+        Map<String, Map<String, String>> formsToReturn = new Map<String, Map<String, String>>();
+        Map<String, List<String>> availableLanguages = new Map<String, List<String>>();
+        Map<String, FormProcessor.FormInfo> baseForms = new Map<String, FormProcessor.FormInfo>();
+        Map<String, String> formNameToId = new Map<String, String>();
+        Map<String, Boolean> baseFields = new Map<String, Boolean>();
+        Map<String, String> fieldOverrides = new Map<String, String>();
+
+        // set up our base forms
+        for(String formName : formsToProcess.keySet()) {
+            formNameToId.put(formName, null);
+            formsToReturn.put(formName, new Map<String, String>());
+        }
+
+        // set up our baseFields and fieldOverrides
+        for(CustomFormDefaultField__mdt field : [SELECT Field_API_Name__c, Override_Builder__c FROM CustomFormDefaultField__mdt]){
+            if(field.Override_Builder__c==true){
+                fieldOverrides.put(field.Field_API_Name__c, '');
+            } else {
+                baseFields.put(field.Field_API_Name__c, false);
+            }
+        }
+
+        // get our forms
+        try {
+            for(Form__c webForm : [SELECT Id, Name, Description__c, Custom_Styles__c, Type__c, Form_Title__c, Javascript__c, Submit_Button_Text__c, Object__c,
+                               Framework__c, Uses_ESRI__c, Available_Languages__c, Form_Action__c, Email_Data_Use_Purpose__c FROM Form__c WHERE Name IN :formsToProcess.keySet()]){            
+               
+                // set our basic base form values
+                formNameToId.put(webForm.Name, webForm.Id);
+                FormProcessor.FormInfo baseForm = new FormProcessor.FormInfo();
+                baseForm.record = webForm;
+                baseForm.finalLanguages = new List<String>();
+                baseForm.finalLanguageFields = new List<String>();
+                baseForm.baseObject = 'Interaction__c';
+                baseForm.framework = 'Bootstrap';
+                baseForm.formFieldList = new List<FormProcessor.FieldInfo>();
+                baseForm.action = webForm.Form_Action__c;
+                baseForm.baseFieldsPresent = baseFields.clone();
+                baseForm.usesEsri = webForm.Uses_ESRI__c;
+                if(String.isEmpty(baseForm.action)){
+                    baseForm.action = '#';
+                }
+               
+                List<String> passedInLanguagesForForm = formsToProcess.get(webForm.Name);
+                // validate our passed-in languages
+                List<String> availableLanguagesForForm = new List<String>();
+                if(String.isNotEmpty(webForm.Available_Languages__c)){
+                    availableLanguagesForForm = webForm.Available_Languages__c.split(';');
+                } else {
+                    availableLanguagesForForm.add('en_US');
+                }
+                for(String language : passedInLanguagesForForm) {
+                    // language variations
+                    String languageISO = language.toLowerCase().substring(0,2); // e.g. en
+                    String languageString = languageISO + '_' + language.toUpperCase().substring(3); // e.g. en_US
+                    String languageField = languageString + '__c'; // e.g. en_US__c
+                    if(availableLanguagesForForm.contains(languageString)) {
+                        baseForm.finalLanguages.add(languageString);
+                        baseForm.finalLanguageFields.add(languageField);
+                    } else {
+                        // language variations
+                        Map<String, String> formToReturnValues = formsToReturn.get(webForm.Name);
+                        formToReturnValues.put(languageString, noFormForLanguage);
+                        formsToReturn.put(webForm.Name, formToReturnValues);
+                    }
+                }
+                                                     
+                // build our maps
+                baseForm.formSectionMap = new Map<String, FormProcessor.SectionInfo>();
+                baseForm.translationMap = new Map<String, Map<String, String>>();
+                baseForm.fieldNamesAndOptionsMap = FormProcessor.getBaseFieldNamesAndOptionsMap(baseForm.finalLanguages);
+
+                // set our base object
+                if(String.isNotEmpty(webForm.Object__c)) baseForm.baseObject = webForm.Object__c;
+               
+                // set our framework and classname base
+                if(String.isNotEmpty(webForm.Framework__c)) baseForm.framework = webForm.Framework__c;
+                baseForm.baseRowClass = (baseForm.framework=='Bootstrap') ? 'row' : 'row-fluid';
+                baseForm.baseColClass = (baseForm.framework=='Bootstrap') ? 'col-xs-' : 'span';
+                baseForm.sectionHeaderClass = (baseForm.framework=='Bootstrap') ? '' : 'row-fluid header-row';
+                baseForm.requiredString = (baseForm.framework=='Bootstrap') ? ' <span class="red">*</span>' : '<sup class="red">*</sup>';
+                baseForm.buttonWrapperOpen = (baseForm.framework=='Bootstrap') ? '<div class="row marginTop30"><div class="col-xs-12">' : '<div class="span12 no_margin">';
+                baseForm.buttonClass = (baseForm.framework=='Bootstrap') ? 'btn btn-default hvr-fade' : 'btn btn-secondary';
+                baseForm.buttonId = (baseForm.framework=='Bootstrap') ? 'submitBtn' : 'submitBtn';
+                baseForm.buttonWrapperClose = (baseForm.framework=='Bootstrap') ? '</div></div>' : '</div>';
+
+                // add our form title and submit button values to the translationMap
+                if(String.isNotEmpty(webForm.Submit_Button_Text__c)) {
+                    baseForm.translationMap.put(webForm.Submit_Button_Text__c, languageMap(baseForm.finalLanguages));
+                }
+                if(String.isNotEmpty(webForm.Form_Title__c)) {
+                    baseForm.translationMap.put(webForm.Form_Title__c, languageMap(baseForm.finalLanguages));
+                }
+                baseForms.put(webForm.Id, baseForm);
+            }
+
+            // handle any forms we didn't find
+            for(String formName : formsToProcess.keySet()) {
+                String formId = formNameToId.get(formName);
+                if(String.isEmpty(formId)) {
+                    Map<String, String> formToReturnValues = new Map<String, String>();
+                    for(String language : formsToProcess.get(formName)) {
+                        String languageISO = language.toLowerCase().substring(0,2); // e.g. en
+                        String languageString = languageISO + '_' + language.toUpperCase().substring(3); // e.g. en_US
+                        formToReturnValues.put(languageString, noFormForLanguage);
+                    }
+                    formsToReturn.put(formName, formToReturnValues);
+                }
+            }
+
+            // get our sections
+            for(Form_Section__c sec : [SELECT Id, Form__c, Name, Hidden__c, Order__c, Section_Title__c FROM Form_Section__c
+                                    WHERE Form__c IN :baseForms.keySet() ORDER BY Order__c]) {
+
+                FormProcessor.FormInfo baseForm = baseForms.get(sec.Form__c);
+                FormProcessor.SectionInfo secInfo = new FormProcessor.SectionInfo();
+                secInfo.titleId = sec.Section_Title__c;
+                secInfo.name = sec.Name;
+                secInfo.fields = new List<FormProcessor.FieldInfo>();
+                secInfo.baseRowClass = baseForm.baseRowClass;
+                secInfo.baseColClass = baseForm.baseColClass;
+                secInfo.sectionHeaderClass = baseForm.sectionHeaderClass;
+                secInfo.hidden = sec.Hidden__c==true;
+                secInfo.sortOrder = (Integer) sec.Order__c;
+                // add our section title value to the translationMap
+                if(String.isNotempty(sec.Section_Title__c)){
+                    baseForm.translationMap.put(sec.Section_Title__c, languageMap(baseForm.finalLanguages));
+                }
+                baseForm.formSectionMap.put(sec.Id, secInfo);
+                baseForms.put(sec.Form__c, baseForm);
+            }
+
+            // get our fields
+            baseForms = addFormFields(baseForms, fieldOverrides);
+
+            // get our translations
+            baseForms = populateTranslations(baseForms);
+
+            // loop through our forms
+            for(String formId : baseForms.keySet()) {
+                FormProcessor.FormInfo baseForm = baseForms.get(formId);
+                Map<String, String> formToReturnValues = formsToReturn.get(baseForm.record.Name);
+                Form__c webForm = baseForm.record;
+                String formName = webForm.Name;
+
+                // loop through our languages and build our forms
+                for(String language : baseForm.finalLanguages) {
+                    String formTitle = '';
+                    String submitButtonText = '';
+                    String languageISO = language.toLowerCase().substring(0,2); // e.g. en
+                   
+                    // set our form name and submit button text
+                    if(String.isNotEmpty(webForm.Form_Title__c) && baseForm.translationMap.get(webForm.Form_Title__c)!=null) {
+                        Map<String, String> formTitleOptions = baseForm.translationMap.get(webForm.Form_Title__c);
+                        formTitle = formTitleOptions.get(language);
+                    }
+                    if(String.isNotEmpty(webForm.Submit_Button_Text__c) && baseForm.translationMap.get(webForm.Submit_Button_Text__c)!=null){
+                        Map<String, String> submitButtonOptions = baseForm.translationMap.get(webForm.Submit_Button_Text__c);
+                        submitButtonText = submitButtonOptions.get(language);
+                    }
+                    if(String.isEmpty(submitButtonText)){
+                        if(baseform.translationMap.get(FormProcessor.defaultPrefix + FormProcessor.defaultSubmitButtonText)!=null){
+                            Map<String, String> defSubmitButtonOptions = baseForm.translationMap.get(FormProcessor.defaultPrefix + FormProcessor.defaultSubmitButtonText);
+                            submitButtonText = defSubmitButtonOptions.get(language);
+                        }
+                    }
+                    if(String.isEmpty(submitButtonText)){
+                        submitButtonText = FormProcessor.defaultSubmitButtonText;
+                    }
+                   
+                    // set our section titles
+                    if(! baseForm.formSectionMap.keySet().isEmpty()) {
+                        for(String secId : baseForm.formSectionMap.keySet()){
+                            FormProcessor.SectionInfo sec = baseForm.formSectionMap.get(secId);
+                            sec.title = '';
+                            sec.fields = new List<FormProcessor.FieldInfo>();
+                            if(String.isNotEmpty(sec.titleId)) {
+                                Map<String, String> sectionTitleOptions = baseForm.translationMap.get(sec.titleId);
+                                sec.title = sectionTitleOptions.get(language);
+                            }
+                            baseForm.formSectionMap.put(secId, sec);
+                        }
+                    }
+                   
+                    // process our field translations
+                    if(! baseForm.formFieldList.isEmpty()) {
+                        for(FormProcessor.FieldInfo field : baseForm.formFieldList) {
+                            if(field.valid && ! field.excludeForLanguages.contains(language)) {
+                                field.yn = new FormProcessor.YesNo(baseForm.translationMap.get(FormProcessor.defaultPrefix + 'Yes').get(language), baseForm.translationMap.get(FormProcessor.defaultPrefix + 'No').get(language));
+                                Map<String, String> baseOptionLabel = baseForm.translationMap.get(FormProcessor.defaultPrefix + FormProcessor.selectFieldBlankOption);
+                                if(baseOptionLabel!=null){
+                                    field.baseOptionLabel = baseOptionLabel.get(language);
+                                }
+                                if(field.baseOptionLabel==null){
+                                      field.baseOptionLabel = FormProcessor.selectFieldBlankOption;
+                                }
+                                String sectId = field.record.Form_Section__c;
+                                FormProcessor.SectionInfo sect = baseForm.formSectionMap.get(sectId);
+                                if(sect!=null) {
+                                    field = getFormFieldTranslation(field, language, baseForm.translationMap);
+                                    sect.fields.add(field);
+                                    baseForm.formSectionMap.put(sectId, sect);
+                                }
+                            } else {
+                                System.debug('invalid field');
+                                System.debug(field);
+                            }
+                        }
+                    }
+                   
+                    // build our form
+                    //String webFormName = webForm.Type__c + '_' + webForm.Name + '_';
+                    //if(String.isNotEmpty(webForm.Description__c)) webFormName += webForm.Description__c.replaceAll('[ _]', '-');
+                    String webFormName = webForm.Description__c;
+                    if(String.isEmpty(webFormName)){
+                        webFormName = webForm.Type__c + '_' + webForm.Name;
+                    }
+                    String form = '<form action="' + baseForm.action + '"';
+                    if(String.isNotEmpty(webForm.Email_Data_Use_Purpose__c)){
+                        form += ' data-email-data-use-purpose="' + webForm.Email_Data_Use_Purpose__c + '"';
+                    }
+                    form += ' method="post" name="' + webFormName + '" id="'+formName+'" autocomplete="off">';
+                   
+                    // add values for system language and form name fields
+                    if(fieldOverrides.get('System_Language__c')!=null){
+                        fieldOverrides.put('System_Language__c', language);
+                    }
+                    if(fieldOverrides.get('Form_Name__c')!=null){
+                        fieldOverrides.put('Form_Name__c', webFormName);
+                    }
+
+                    // add field overrides
+                    for(String fieldName : fieldOverrides.keySet()) {
+                        form += '<input type="hidden" name="' + getECRMFieldName(fieldName) + '" value="' + fieldOverrides.get(fieldName) + '">';
+                    }
+
+                    // add base fields not already accounted for
+                    for(String fieldName : baseForm.baseFieldsPresent.keySet()) {
+                        Boolean isPresent = baseForm.baseFieldsPresent.get(fieldName);
+                        if(isPresent!=true) {
+                            form += '<input type="hidden" name="' + getECRMFieldName(fieldName) + '" value="">';
+                        }
+                    }
+                   
+                    // add styles if necessary
+                    if(String.isNotEmpty(webForm.Custom_Styles__c)) {
+                        form+= '<style><!-- ' + webForm.Custom_Styles__c + ' --></style>';
+                    }
+                   
+                    if(String.isNotEmpty(formTitle)){
+                        form += '<h2>'+formTitle+'</h2>';
+                    }
+
+                    // add our esriEnabled hidden div
+                    if(baseForm.usesEsri==true) { // add the esriEnabled hidden div right after the hidden fields
+                        form += '<div id="esriEnabled" style="display:none"></div>';
+                    }
+                   
+                    // add our sections
+                    if(! baseForm.formSectionMap.keySet().isEmpty()) {
+                        List<FormProcessor.SectionInfo> formSectionList = new List<FormProcessor.SectionInfo>();
+                        formSectionList.addAll(baseForm.formSectionMap.values());
+                        formSectionList.sort();
+                        for(FormProcessor.SectionInfo section : formSectionList) {
+                            String sectionText = buildSection(section);
+                            form += sectionText;
+                        }
+                    }
+                   
+                    // add a submit button
+                    form += baseForm.buttonWrapperOpen + '<input type="submit" class="' + baseForm.buttonClass + '" value="'+ submitButtonText + '"';
+                    if( String.isNotEmpty(baseForm.buttonId)) form += ' id="' + baseForm.buttonId + '"';
+                    form += '>' + baseForm.buttonWrapperClose;
+                   
+                    // add javascript if necessary
+                    if(String.isNotEmpty(webForm.Javascript__c)) {
+                        form += '<script>' + webForm.Javascript__c + '</script>';
+                    }
+                   
+                    // close the form
+                    form += '</form>';
+                   
+                    // map the translation
+                    formToReturnValues.put(language, generateHTML(languageISO, form));
+                }
+                // map our form
+                formsToReturn.put(formName, formToReturnValues);
+            }
+           
+            // catch errors (no form found)
+        } catch( Exception e) {
+            System.debug(e.getMessage());
+            System.debug(e.getLineNumber());
+            throw new FormProcessor.FormProcessorException(noFormForLanguage);
+        }
+        return formsToReturn;
+    }
+   
+    /*
+         * private method used to generate the basic HTML wrapper for each form
+         *
+         * @param - languageISO
+         * a two-letter representation of the language (e.g. en)
+         *
+         * @param - body
+         * the HTML to include in the body of the returned HTML
+         *
+         * @return - markup
+         * a complete HTML document containing the form
+         */
+    private static String generateHTML(String languageISO, String body) {
+        String header = '<!DOCTYPE html> <html lang="' + languageISO + '">';
+        header += '<head><title>Web form</title></head><body>';
+        String footer = '</body></html>';
+        String markup = header + body + footer;
+        return markup;
+    }
+
+    /*
+         * method called to create an empty map of language translation values
+         *
+         * @param - languages
+         * a list of languages to include as keys
+         *
+         * @return - results
+         * a map with passed in languages as keys and null strings as values
+         */
+    private static Map<String, String> languageMap(List<String> languages) {
+        Map<String, String> results = new Map<String, String>();
+        for(String language : languages) {
+            results.put(language, null);
+        }
+        return results;
+    }
+   
+    /*
+        * method called to create a map of base translations needed for most forms
+        */
+    private static Map<String, Map<String, String>> getBaseFieldNamesAndOptionsMap(List<String> languages) {
+        Map<String, Map<String, String>> baseFieldNamesAndOptionsMap = new Map<String, Map<String, String>>();
+        for(String value : FormProcessor.baseTranslations){
+            String fieldReference = FormProcessor.defaultPrefix + value;
+            Map<String, String> baseFieldLanguages = FormProcessor.languageMap(languages);
+            baseFieldLanguages.put('en_US', value);
+            baseFieldNamesandOptionsMap.put(fieldReference, baseFieldLanguages);
+        }
+        return baseFieldNamesAndOptionsMap;
+    }
+
+    /*
+         * method used to add Form_Field__c records and related data to the forms being processed
+         *
+         * @param - baseForms
+         * a map with form Ids as keys and corresponding FormProcessor.FormInfo objects as their values
+         *
+         * @return - baseForms
+         * the same map but with records added to each object's formFieldList, fieldNamesAndOptionsMap, and translationMap properties
+         */
+    private static Map<String, FormProcessor.FormInfo> addFormFields(Map<String, FormProcessor.FormInfo> baseForms, Map<String, String> fieldOverrides){
+        Map<String, Map<String,Schema.SobjectField>> objectFieldMap = new Map<String, Map<String,Schema.SobjectField>>();
+        List<String> formNames = new List<String>();
+        List<String> fieldOverrideKeys = new List<String>();
+        for(String formName : baseForms.keySet()){
+            formNames.add('\'' + String.escapeSingleQuotes(formName)  + '\'');
+        }
+        for(String fieldOverride : fieldOverrides.keySet()){
+            fieldOverrideKeys.add('\'' + String.escapeSingleQuotes(fieldOverride) + '\'');
+        }
+        String fieldQuery = 'SELECT Id, Form__c, Name, Field__c, Form_Section__c, Hidden__c, Layout_Width__c, Order__c, Override_Standard_Label_Value__c, ' +
+                            'Regex_Validation__c, Required__c, Uses_Full_Row__c, Default_Value__c, Exclude_for_Language__c, Display_As_Picklist__c, Display_As__c, ' +
+                            'Allow_Multiple_Answers__c, (SELECT Id, Form_Translation__c, Form_Translation__r.EN_US__c FROM Form_Picklist_Values__r ORDER BY Order__c)' +
+                            'FROM Form_Field__c WHERE Form__c IN (' + String.join(formNames, ',') + ') ';
+        if(! fieldOverrideKeys.isEmpty()) {
+            fieldQuery += ' AND Field__c NOT IN( ' + String.join(fieldOverrideKeys, ',') + ' ) ';
+        }
+        fieldQuery += ' ORDER BY Order__c';
+        List<Form_Field__c> formFields = Database.query(fieldQuery);
+        for(Form_Field__c record : formFields) {
+            FormProcessor.FormInfo baseForm = baseForms.get(record.Form__c);
+            String baseFormObject = baseForm.record.Object__c;
+            if(String.isEmpty(baseFormObject)) baseFormObject = 'Interaction__c';
+            objectFieldMap.put(baseFormObject, null);
+            FormProcessor.FieldInfo field = new FormProcessor.FieldInfo();
+            field.record = record;
+            field.name = record.Field__c;
+            if(String.isNotEmpty(field.name) && baseForm.baseFieldsPresent.containsKey(field.name)){
+                baseForm.baseFieldsPresent.put(field.name, true);
+            }
+            field.objectName = baseForm.baseObject;
+            field.options = new List<FormProcessor.OptionInfo>();
+            field.baseColClass = baseForm.baseColClass;
+            field.framework = baseForm.framework;
+            field.requiredString = baseForm.requiredString;
+            field.valid = true;
+            field.hidden = record.Hidden__c == true;
+            field.required = record.Required__c == true;
+            field.defaultValue = '';
+            field.excludeForLanguages = (String.isNotEmpty(record.Exclude_for_Language__c)) ? record.Exclude_for_Language__c.split(';') : new List<String>();
+            field.formType = baseForm.record.Type__c;
+            field.showAllOptions = record.Form_Picklist_Values__r==null || record.Form_Picklist_Values__r.isEmpty();
+            field.width = (String.isNotEmpty(record.Layout_Width__c)) ? Integer.valueOf(record.Layout_Width__c.replaceAll('[^0-9]','')) : 6;
+            field.isSubscriptionField = field.objectName=='Interaction__c' && field.record.Field__c==subscriptionFieldName;
+            if(record.Uses_Full_Row__c==true || field.width > 12) field.width = 12;
+            if(String.isEmpty(record.Form_Section__c) || baseForm.formSectionMap.get(record.Form_Section__c)==null) {
+                field.valid = false; // fields must have a valid section
+            }
+            field.sortOrder = (Integer) record.Order__c;
+            if(String.isNotEmpty(record.Field__c) && record.Field__c.contains('.')) {
+                List<String> fieldSplit = record.Field__c.split('\\.');
+                objectFieldMap.put(fieldSplit[0], null);
+                field.objectName = fieldSplit[0];
+                field.name = fieldSplit[1];
+            }
+            if(String.isNotEmpty(record.Override_Standard_Label_Value__c)) {
+                baseForm.translationMap.put(record.Override_Standard_Label_Value__c, languageMap(baseForm.finalLanguages));
+            }
+            if(field.valid && field.isSubscriptionField) { // handle our subscription field
+                baseForm.fieldNamesAndOptionsMap.put(FormProcessor.defaultPrefix + subscriptionTranslationRecordName, languageMap(baseForm.finalLanguages));
+            } else if(field.valid && ! field.showAllOptions && ! field.hidden){ // handle Form Picklist Value records
+                for(Form_Picklist_Value__c option : record.Form_Picklist_Values__r){
+                    FormProcessor.OptionInfo opt = new FormProcessor.OptionInfo();
+                    opt.label = option.Form_Translation__r.EN_US__c;
+                    opt.labelEng = option.Form_Translation__r.EN_US__c;
+                    opt.value = option.Form_Translation__r.EN_US__c;
+                    opt.translationId = option.Form_Translation__c;
+                    baseForm.translationMap.put(option.Form_Translation__c, languageMap(baseForm.finalLanguages));
+                    field.options.add(opt);
+                }
+            }
+            if(field.valid){
+                baseForm.formFieldList.add(field);
+                if(FormProcessor.esriOnlyFields.contains(field.name)) {
+                    baseForm.usesEsri = true;
+                }
+            }
+            baseForms.put(record.Form__c, baseForm);
+        }
+
+        // get our object field mappings
+        List<String> objectNameList = new List<String>();
+        objectNameList.addAll(objectFieldMap.keySet());
+        for(Schema.DescribeSObjectResult obj : Schema.describeSObjects(objectNameList)){
+            objectFieldMap.put(obj.getName(), obj.fields.getMap());
+        }
+
+        // grab our form field schema information and gather our field and picklist labels for translation
+        for(String formId : baseForms.keySet()) {
+            FormProcessor.FormInfo baseForm = baseForms.get(formId);
+            if(! baseForm.formFieldList.isEmpty()){
+                for(FormProcessor.FieldInfo field : baseForm.formFieldList){
+                    if(String.isNotEmpty(field.name)) {
+                        if(String.isEmpty(field.objectName)) field.objectName='Interaction__c';
+                        Map<String,Schema.SobjectField> fieldMap = objectFieldMap.get(field.objectName);
+                        if(fieldMap!=null) {
+                            Schema.SobjectField fSchema = fieldMap.get(field.name.toLowerCase());
+                            if(fSchema!=null){
+                                String defaultValue;
+                                List<String> defaultValues = new List<String>();
+                                List<String> validDefaults = new List<String>();
+                                Boolean hasDefault = false;
+                                if(String.isNotEmpty(field.record.Default_Value__c)){
+                                    defaultValue = field.record.Default_Value__c.normalizeSpace();
+                                    hasDefault = true;
+                                }
+                                field.labelEng = fSchema.getDescribe().getLabel();
+                                field.label = field.labelEng;
+                                field.originalType = fSchema.getDescribe().getType().name().toLowerCase();
+                                field.schema = fSchema;
+                                if(field.originalType.containsIgnoreCase('picklist') && field.hidden!=true){
+                                    if(((field.originalType=='multipicklist' || field.record.Allow_Multiple_Answers__c==true) && String.isEmpty(field.record.Display_As__c)) || field.record.Display_As__c=='Checkboxes'){
+                                        field.type = 'multipicklist';
+                                    } else if(field.record.Display_As__c=='Radio Buttons'){
+                                        field.type = 'radio';
+                                    } else {
+                                        field.type = 'picklist';
+                                    }
+                                } else if(! field.originalType.containsIgnoreCase('picklist') && ! field.options.isEmpty()){
+                                    //if(field.record.Display_as_Picklist__c==true) {
+                                        if((field.record.Allow_Multiple_Answers__c==true && String.isEmpty(field.record.Display_As__c)) || field.record.Display_As__c=='Checkboxes') {
+                                            field.type = 'multipicklist';
+                                            if(hasDefault) {
+                                                defaultValues = defaultValue.split(';');
+                                            }
+                                        } else {
+                                            if(field.record.Display_As__c=='Radio Buttons'){
+                                                field.type = 'radio';
+                                            } else {
+                                                field.type = 'picklist';
+                                            }
+                                            if(hasDefault){
+                                                defaultValues.add(defaultValue);
+                                            }
+                                        }
+                                        for(FormProcessor.OptionInfo opt : field.options) {
+                                            opt.isDefault = defaultValues.contains(opt.value);
+                                        }
+                                    /*} else {
+                                        field.options.clear(); // don't display as a picklist
+                                    }*/
+                                }
+                                if(String.isEmpty(field.type)) {
+                                    field.type = field.originalType;
+                                }
+                                if(field.type=='id' || field.type=='reference') {
+                                    field.hidden = true;
+                                }
+                                if(field.isSubscriptionField) {
+                                    field.type = 'boolean';
+                                    field.options.clear();
+                                }
+                                if(field.originalType.containsIgnoreCase('picklist') && field.showAllOptions==true){
+                                    Boolean isMulti = field.type=='multipicklist';
+                                    if(! hasDefault && String.isNotEmpty((String) fSchema.getDescribe().getDefaultValue())) {
+                                        defaultValue = (String) fSchema.getDescribe().getDefaultValue();
+                                        hasDefault = true;
+                                    }
+                                    if(hasDefault){
+                                        if(isMulti) {
+                                            defaultValues = defaultValue.split(';');
+                                        } else {
+                                            defaultValues.add(defaultValue);
+                                        }
+                                    }
+                                    List<Schema.PicklistEntry> optionList = fSchema.getDescribe().getPicklistValues();
+                                    if(! optionList.isEmpty()) {
+                                        for(Schema.PicklistEntry ple : optionList) {
+                                            FormProcessor.OptionInfo oInfo = new FormProcessor.OptionInfo();
+                                            oInfo.labelEng = ple.getLabel();
+                                            oInfo.label = ple.getLabel(); // this will get overwritten later if a translation exists
+                                            oInfo.value = ple.getValue();
+                                            if(hasDefault && (defaultValues.contains(ple.getValue()) || defaultValues.contains(ple.getLabel()))){
+                                                oInfo.isDefault = true;
+                                                validDefaults.add(ple.getValue());
+                                            } else {
+                                                oInfo.isDefault = false;
+                                            }
+                                            field.options.add(oInfo);
+                                            Map<String, String> optionLanguages = new Map<String, String>();
+                                            for(String language : baseForm.finalLanguages) {
+                                                optionLanguages.put(language, ple.getLabel());
+                                            }
+                                            baseForm.fieldNamesAndOptionsMap.put(field.objectName + ' : ' + field.name + ' : ' + ple.getValue(), optionLanguages);
+                                        }
+                                    }
+                                    defaultValue = String.join(validDefaults, ';');
+                                    hasDefault = ! validDefaults.isEmpty();
+                                    if(field.options.isEmpty()) {
+                                        if(! field.hidden) field.valid = false; // otherwise we'd have an empty select element
+                                    }
+                                }
+                                if(field.valid){
+                                    if(hasDefault) field.defaultValue = defaultValue;
+                                    Map<String, String> fieldLanguages = new Map<String, String>();
+                                    for(String language : baseForm.finalLanguages) {
+                                        fieldLanguages.put(language, field.label);
+                                    }
+                                    baseForm.fieldNamesAndOptionsMap.put(field.objectName + ' : ' + field.name, fieldLanguages);
+                                }
+                            } else field.valid = false; // field name is not valid
+                        } else field.valid = false; // object is not valid
+                    }
+                }
+            }
+            baseForms.put(formId, baseForm);
+        }
+        return baseForms;
+    }
+
+    /*
+         * method used to populate the localized values for each of the processed forms in the languages requested
+         *
+         * @param - baseForms
+         * a map with form Ids as keys and corresponding FormProcessor.FormInfo objects as their values
+         *
+         * @return - baseForms
+         * the same map but with values added where possible for each translationsMap and fieldNamesAndOptionsMap key
+         */
+    private static Map<String, FormProcessor.FormInfo> populateTranslations(Map<String, FormProcessor.FormInfo> baseForms){
+        Set<String> allFormsFinalLanguageFieldKeys = new Set<String>{'en_US__c'};
+        Set<String> allFormsTranslationKeys = new Set<String>();
+        Set<String> allFormsFieldNamesAndOptionKeys = new Set<String>();
+        for(String formId : baseForms.keySet()){
+            FormProcessor.FormInfo baseForm = baseForms.get(formId);
+            allFormsFinalLanguageFieldKeys.addAll(baseForm.finalLanguageFields);
+            allFormsTranslationKeys.addAll(baseForm.translationMap.keySet());
+            allFormsFieldNamesAndOptionKeys.addAll(baseForm.fieldNamesAndOptionsMap.keySet());
+        }
+        List<String> allFormsFinalLanguageFields = new List<String>();
+        allFormsFinalLanguageFields.addAll(allFormsFinalLanguageFieldKeys);
+        Map<String,Schema.SobjectField> translationFields = Schema.SObjectType.Form_Translation__c.fields.getMap();
+        for(String fieldNameLC : translationFields.keySet()){
+            Matcher fieldTest = languagePattern.matcher(fieldNameLC.toLowerCase());
+            if(fieldTest.matches()){
+                Schema.SObjectField translationField = translationFields.get(fieldNameLC);
+                String fieldName = translationField.getDescribe().getName();
+                String baseFieldName = fieldName.substring(0, 2);
+                if(! allFormsFinalLanguageFields.contains(fieldName)){
+                    allFormsFinalLanguageFields.add(fieldName);
+                }
+            }
+        }
+        if(! allFormsTranslationKeys.isEmpty()) {
+            List<String> translationMapKeys = new List<String>();
+            translationMapKeys.addAll(allFormsTranslationKeys);
+            String translationQuery = 'SELECT Id, Name, ' + String.join(allFormsFinalLanguageFields, ',') +
+                                      ' FROM Form_Translation__c WHERE Id IN(\'' + String.join( translationMapKeys, '\',\'') + '\')';
+            List<Form_Translation__c> translations = Database.query(translationQuery);
+            if(! translations.isEmpty()) {
+                for(Form_Translation__c tl : translations) {
+                    Map<String, String> baseLanguageValues = new Map<String, String>();
+                    for(String fieldName : allFormsFinalLanguageFields){
+                        String fieldValue = (String) tl.get(fieldName);
+                        String baseFieldName = fieldName.substring(0, 2);
+                        String baseLanguageValue = baseLanguageValues.get(baseFieldName);
+                        if(baseLanguageValue==null && String.isNotEmpty(fieldValue)){
+                            baseLanguageValues.put(baseFieldName, fieldValue);
+                        }
+                    }
+                    for(String formId : baseForms.keySet()){
+                        FormProcessor.FormInfo baseForm = baseForms.get(formId);
+                        if(baseForm.translationMap.containsKey(tl.Id)) {
+                            Map<String, String> translatedValues = languageMap(baseForm.finalLanguages);
+                            for(String language : translatedValues.keySet()) {
+                                String languageField = language + '__c';
+                                String translation = (String) tl.get(languageField);
+                                if(String.isEmpty(translation)){
+                                    String baseLanguageField = language.substring(0, 2);
+                                    if(baseLanguageValues.containsKey(baseLanguageField)){
+                                        translation = baseLanguageValues.get(baseLanguageField);
+                                    }
+                                }
+                                if(String.isEmpty(translation)){
+                                    translation = tl.Name;
+                                }
+                                translatedValues.put(language, translation);
+                            }
+                            baseForm.translationMap.put(tl.Id, translatedValues);
+                            baseForms.put(formId, baseForm);
+                        }
+                    }
+                }
+            }
+        }
+        if(! allFormsFieldNamesAndOptionKeys.isEmpty()) {
+            List<String> fieldNamesAndOptions = new List<String>();
+            List<String> escapedFieldNamesAndOptions = new List<String>();
+            fieldNamesAndOptions.addAll(allFormsFieldNamesAndOptionKeys);
+            for(String fieldOrOptionName : fieldNamesAndOptions) {
+                escapedFieldNamesAndOptions.add(String.escapeSingleQuotes(fieldOrOptionName)); // escape single quotes
+            }
+            String translationQuery2 = 'SELECT Id, Name, Field_Reference__c, ' + String.join(allFormsFinalLanguageFields, ',') +
+                                       ' FROM Form_Translation__c WHERE Field_Reference__c IN(\'' + String.join(escapedFieldNamesAndOptions, '\',\'') + '\')';
+            List<Form_Translation__c> translations2 = Database.query(translationQuery2);
+            if(! translations2.isEmpty()) {
+                for(Form_Translation__c tl : translations2) {
+                    Map<String, String> baseLanguageValues = new Map<String, String>();
+                    for(String fieldName : allFormsFinalLanguageFields){
+                        String fieldValue = (String) tl.get(fieldName);
+                        String baseFieldName = fieldName.substring(0, 2);
+                        String baseLanguageValue = baseLanguageValues.get(baseFieldName);
+                        if(baseLanguageValue==null && String.isNotEmpty(fieldValue)){
+                            baseLanguageValues.put(baseFieldName, fieldValue);
+                        }
+                    }
+                    for(String formId : baseForms.keySet()) {
+                        FormProcessor.FormInfo baseForm = baseForms.get(formId);
+                        if(baseForm.fieldNamesAndOptionsMap.containsKey(tl.Field_Reference__c)) {
+                            Map<String, String> translatedValues = baseForm.fieldNamesAndOptionsMap.get(tl.Field_Reference__c);
+                            if(translatedValues==null){
+                                translatedValues = languageMap(baseForm.finalLanguages);
+                            }
+                            for(String languageString : translatedValues.keySet()) {
+                                String languageField = languageString + '__c';
+                                String translation2 = (String) tl.get(languageField);
+                                if(String.isEmpty(translation2)){
+                                    String baseLanguageField = languageString.substring(0, 2);
+                                    if(baseLanguageValues.containsKey(baseLanguageField)){
+                                        translation2 = baseLanguageValues.get(baseLanguageField);
+                                    }
+                                }
+                                if(String.isNotEmpty(translation2)) {
+                                    translatedValues.put(languageString, translation2);
+                                }
+                            }
+                            baseForm.translationMap.put(tl.Field_Reference__c, translatedValues);
+                            baseForms.put(formId, baseForm);
+                        }
+                    }
+                }
+            }
+        }
+        // handle Yes/No values
+        for(String formId : baseForms.keySet()) {
+            FormProcessor.FormInfo baseForm = baseForms.get(formId);
+            Map<String, String> yesValues = baseForm.translationMap.get(FormProcessor.defaultPrefix + 'Yes');
+            Map<String, String> noValues = baseForm.translationMap.get(FormProcessor.defaultPrefix + 'No');
+            if(yesValues==null) yesValues = languageMap(baseForm.finalLanguages);
+            if(noValues==null) noValues = languageMap(baseForm.finalLanguages);
+            for(String language : baseForm.finalLanguages) {
+                String languageISO = language.toLowerCase().substring(0,2); // e.g. en
+                FormProcessor.YesNo yn = yesNoMap.get(languageISO);
+                if(yn!=null) {
+                    String yesValue = yesValues.get(language);
+                    String noValue = noValues.get(language);
+                    if(yesValue==null) {
+                        yesValue = yn.Yes;
+                    }
+                    if(noValue==null) {
+                        noValue = yn.No;
+                    }
+                    yesValues.put(language, yesValue);
+                    noValues.put(language, noValue);
+                }
+            }
+            baseForm.translationMap.put(FormProcessor.defaultPrefix + 'Yes', yesValues);
+            baseForm.translationMap.put(FormProcessor.defaultPrefix + 'No', noValues);
+            baseForms.put(formId, baseForm);
+        }
+        return baseForms;
+    }
+
+    /*
+         * method used to update a field's label, option labels, and default values based on localization values found in the corresponding translationMap
+         *
+         * @param - field
+         * a FormProcessor.FormInfo record for the given field
+         *
+         * @param - language
+         * a string representing the language for translation (e.g. en_US)
+         *
+         * @param - translationMap
+         * a map of fields, options, and override keys mapped to the form's available languages or the languages sent in the original request
+         *
+         * @return - field
+         * the passed in FormProcessor.FormInfo record with localized labels and option labels where available
+         * labels, option labels, and default values that have no translated equivalent will be returned unchanged
+         */
+    private static FormProcessor.FieldInfo getFormFieldTranslation(FormProcessor.FieldInfo field, String language, Map<String, Map<String, String>> translationMap){
+        field.label = field.labelEng;
+        if(field.isSubscriptionField) {
+            field.label = '';
+            Map<String, String> labelOptions = translationMap.get(FormProcessor.defaultPrefix + subscriptionTranslationRecordName);
+            if(labelOptions!=null) {
+                field.label = labelOptions.get(language);
+            }
+            if(String.isEmpty(field.label)) {
+                field.label = subscriptionTranslationRecordDefault;
+            }
+        } else {
+            if(String.isNotEmpty(field.label)) {
+                String translatedLabel = '';
+                Map<String, String> translatedLabelOptions = translationMap.get(field.objectName + ' : ' + field.name);
+                if(translatedLabelOptions!=null){
+                    translatedLabel = translatedLabelOptions.get(language);
+                }
+                if(String.isNotEmpty(translatedLabel)) field.label = translatedLabel;
+            }
+            if(String.isNotEmpty(field.record.Override_Standard_Label_Value__c)) {
+                String overrideLabel = '';
+                Map<String, String> overrideLabelOptions = translationMap.get(field.record.Override_Standard_Label_Value__c);
+                if(overrideLabelOptions!=null){
+                    overrideLabel = overrideLabelOptions.get(language);
+                }
+                if(String.isNotEmpty(overrideLabel)) field.label = overrideLabel;
+            }
+            if(! field.options.isEmpty() ) {
+                for( FormProcessor.OptionInfo o : field.options) {
+                    o.label = o.labelEng;
+                    String translatedLabel = '';
+                    Map<String, String> translatedLabelOptions = null;
+                    if(String.isNotEmpty(o.translationId)) {
+                        translatedLabelOptions = translationMap.get(o.translationId);
+                    } else {
+                        translatedLabelOptions = translationMap.get(field.objectName + ' : ' + field.name + ' : ' + o.value);
+                    }
+                    if(translatedLabelOptions!=null){
+                        translatedLabel = translatedLabelOptions.get(language);
+                    }
+                    if(String.isNotEmpty(translatedLabel)) o.label = translatedLabel;
+                }
+            }
+        }
+        return field;
+    }
+
+    /*
+         * method used to generate the HTML for a form section
+         *
+         * @param - section
+         * a FormProcessor.SectionInfo object representing the section to process
+         *
+         * @return - returnString
+         * the HTML for the passed-in section
+         */
+    private static String buildSection(FormProcessor.SectionInfo section) {
+        String returnString = '<div class="section" id="' + section.name + '"';
+        if(section.hidden) {
+            returnString += ' style="display:none"';
+        }
+        returnString += '>';
+        Integer fullRowSize = 12;
+        Integer curRowSize = 0;
+        Boolean rowOpen = false;
+        if(String.isNotEmpty(section.title)){
+            if(String.isNotEmpty(section.sectionHeaderClass)) {
+                returnString += '<div class="' + section.sectionHeaderClass + '"><div class="' + section.baseColClass + '12"><h2>' + section.title + '</h2></div></div>';
+            } else {
+                returnString += '<h3>' + section.title + '</h3>';
+            }
+        }
+        section.fields.sort();
+        for(FormProcessor.FieldInfo field : section.fields) {
+            if(field.hidden) {
+                returnString += FormProcessor.buildField(field, true);
+            } else {
+                Boolean isStateField = FormProcessor.stateFields.contains(field.record.Field__c);
+                String fieldDivId = '';
+                if(curRowSize + field.width > fullRowSize) curRowSize = 0;
+                if(curRowSize == 0){
+                    if(rowOpen) returnString += '</div>';
+                    returnString += '<div class="' + section.baseRowClass + '">';
+                    rowOpen = true;
+                }
+                if(isStateField){
+                    fieldDivId = 'stateBox';
+                    if(String.isEmpty(field.defaultValue)){
+                        field.defaultValue = field.baseOptionLabel;
+                    }
+                    returnString += '<input type="hidden" id="stateOrProvinceLbl" value="' + field.label + '">';
+                    returnString += '<input type="hidden" id="defaultSelect" value="' + field.defaultValue + '">';
+                    field.defaultValue = ''; // clear default value
+                }
+                returnString += '<div class="' + field.baseColClass + field.width;
+                if(field.type=='picklist' && field.framework=='Foundation'){ // foundation framework adds the class 'salesforce-dropdown' to this div
+                    returnString += ' salesforce-dropdown';
+                }
+                returnString += '" id="' + fieldDivId + '">';
+                returnString += FormProcessor.buildField(field, isStateField);
+                returnString += '</div>';
+                curRowSize += field.width;
+            }
+        }
+        if(rowOpen) returnString += '</div>';
+        returnString += '</div>';
+        return returnString;
+    }
+
+    /*
+         * method used to generate the HTML for a form field
+         *
+         * @param - field
+         * a FormProcessor.FieldInfo object representing the field to process
+         *
+         * @return - returnString
+         * the HTML for the passed-in field
+         */
+    private static String buildField(FormProcessor.FieldInfo field, Boolean hidden) {
+        String returnString = '';
+        String ecrmFieldName = FormProcessor.getECRMFieldName(field.name);
+        if(hidden==true) {
+            returnString += '<input type="hidden" name="' + ecrmFieldName + '" id="' + ecrmFieldName + '" value="' + field.defaultValue + '">';
+        } else {
+            if(field.type=='multipicklist' || field.type=='boolean' || field.type=='radio') {
+                returnString += '<fieldset' + ( ( field.required) ? ' data-validate="required"' : '') + '>';
+                returnString += '<legend>' + field.label;
+                if(field.required) {
+                    returnString += field.requiredString;
+                }
+                returnString += '</legend>';
+            }
+            if(field.framework=='Foundation'){ // Foundation framework - labels come before fields
+                if(field.type!='multipicklist' && field.type!='boolean' && field.type!='radio') {
+                    returnString += '<label for="' + ecrmFieldName + '">' + field.label;
+                    if(field.required) {
+                        returnString += field.requiredString;
+                    }
+                    returnString += '</label>';
+                }
+            }
+            switch on field.type {
+                when 'picklist' {
+                    // returnString += '<select name="' + ecrmFieldName + '" id="' + ecrmFieldName + '" class="' + field.baseColClass + field.width;
+                    returnString += '<select name="' + ecrmFieldName + '" id="' + ecrmFieldName + '"';
+                    if(field.required){
+                        returnString += ' class="required"';
+                    }
+                    returnString += '>';
+                    returnString += '<option value="">' + field.baseOptionLabel + '</option>';
+                    for(FormProcessor.OptionInfo opt : field.options) {
+                        returnString += '<option value="' + opt.value + '"';
+                        if(opt.isDefault==true) returnString += ' selected';
+                        returnString += '>' + opt.label + '</option>';
+                    }
+                    returnString += '</select>';
+                }
+                when 'multipicklist' {
+                    Integer optNo = 0;
+                    for(FormProcessor.OptionInfo opt : field.options) {
+                        returnString += '<label class="radio"><input type="checkbox" name="' + ecrmFieldName + '" id="' + ecrmFieldName + optNo + '" value="' + opt.value + '"';
+                        if(field.required) {
+                            returnString += ' class="required"';
+                        }
+                        if(opt.isDefault==true) {
+                            returnString += ' checked';
+                        }
+                        returnString += '> ' + opt.label + '</label>';
+                        optNo+=1;
+                    }
+                    returnString += '</fieldset>';
+                }
+                when 'radio' {
+                    Integer optNo = 0;
+                    for(FormProcessor.OptionInfo opt : field.options) {
+                        returnString += '<label class="radio"><input type="radio" name="' + ecrmFieldName + '" id="' + ecrmFieldName + optNo + '" value="' + opt.value + '"';
+                        if(field.required) {
+                            returnString += ' class="required"';
+                        }
+                        if(opt.isDefault==true) {
+                            returnString += ' checked';
+                        }
+                        returnString += '> ' + opt.label + '</label>';
+                        optNo+=1;
+                    }
+                    returnString += '</fieldset>';
+                }
+                when 'textarea' {
+                    // returnString += '<textarea name="' + ecrmFieldName + '" id="' + ecrmFieldName + '" class="' + field.baseColClass + field.width;
+                    returnString += '<textarea name="' + ecrmFieldName + '" id="' + ecrmFieldName + '"';
+                    if(field.required) {
+                        returnString += ' class="required"';
+                    }
+                    returnString += ' rows="3"';
+                    Integer maxLength = field.schema.getDescribe().getLength();
+                    if(maxLength!=null && maxLength > 0 ) returnString += ' maxlength="' + maxLength + '"';
+                    returnString += '>' + field.defaultValue + '</textarea>';
+                }
+                when 'boolean' {
+                    String inputType = (field.isSubscriptionField && field.formType=='eNews') ? 'checkbox' : 'radio';
+                    returnString += '<label class="radio"><input type="' + inputType + '" name="' + ecrmFieldName + '" id="' + ecrmFieldName + '-yes" value="True"';
+                    if(field.required) {
+                        returnString += ' class="required"';
+                    }
+                    if(! field.isSubscriptionField && field.schema.getDescribe().getDefaultValue()==true) returnString += ' checked';
+                    returnString += '> ' + field.yn.Yes + '</label>';
+                    if(inputType == 'radio') {
+                        returnString += '<label class="radio"><input type="radio" name="' + ecrmFieldName + '" id="' + ecrmFieldName + '-no" value="False"';
+                        if(field.required) {
+                            returnString += ' class="required"';
+                        }
+                        if(! field.isSubscriptionField && field.schema.getDescribe().getDefaultValue()!=true) returnString += ' checked';
+                        returnString += '> ' + field.yn.No + '</label>';
+                    }
+                    returnString += '</fieldset>';
+                }
+                when else {
+                    String inputType = FormProcessor.fieldTypeMap.get(field.type);
+                    if(String.isEmpty(inputType)) inputType = 'text';
+                    returnString += '<input type="' + inputType + '" name="' + ecrmFieldName + '" id="' + ecrmFieldName + '" value="' + field.defaultValue + '"';
+                    if(field.required) {
+                        returnString += ' class="required"';
+                    }
+                    if(inputType=='text' || inputType=='email' || inputType=='tel'){
+                        Integer maxLength = field.schema.getDescribe().getLength();
+                        if(maxLength!=null && maxLength > 0) returnString += ' maxlength="' + maxLength + '"';
+                    }
+                    if(field.type=='double' || field.type=='percent' || field.type=='currency'){
+                        Integer decimals = field.schema.getDescribe().getScale();
+                        String step = '1';
+                        if(decimals!=null && decimals>0) {
+                            step = '0.';
+                            for(Integer i=1; i<decimals; i++) {
+                                step += '0';
+                            }
+                            step += '1';
+                        }
+                        returnString += ' step="' + step + '"';
+                    }
+                    returnString += '>';
+                }
+            }
+            if(field.framework=='Bootstrap'){ // Bootstrap framework - labels come after fields
+                if(field.type!='multipicklist' && field.type!='boolean' && field.type!='radio') {
+                    returnString += '<label for="' + ecrmFieldName + '">' + field.label;
+                    if(field.required) {
+                        returnString += field.requiredString;
+                    }
+                    returnString += '</label>';
+                }
+            }
+        }
+        return returnString;
+    }
+
+    /*
+         * method used to generate a field name based on the JSON name expected by the ECRM team
+         *
+         * @param - sfdcFieldName
+         * the Salesforce API field name
+         *
+         * @return - ecrmFieldName
+         * the JSON name to use in the form
+         */
+    public static String getECRMFieldName(String sfdcFieldName) {
+        String ecrmFieldName = '';
+        if(FormProcessor.fieldNameExceptionMap.keySet().contains(sfdcFieldName)){
+            ecrmFieldName = FormProcessor.fieldNameExceptionMap.get(sfdcFieldName);
+        } else {
+            List<String> fieldNameParts = sfdcFieldName.toLowerCase().replaceAll('__c', '').split('_');
+            Integer partNo = 0;
+            for(String part : fieldNameParts){
+                if(partNo>0) part = part.capitalize();
+                ecrmFieldName += part;
+                partNo+=1;
+            }
+        }
+        return ecrmFieldName;
+    }
+
+    /* wrapper classes */
+       
+    private class FormInfo {
+        private string action;
+        private String baseObject;
+        private String baseColClass;
+        private String baseRowClass;
+        private String sectionHeaderClass;
+        private String requiredString;
+        private String buttonWrapperOpen;
+        private String buttonClass;
+        private String buttonId;
+        private String buttonWrapperClose;
+        private String framework;
+        private Form__c record;
+        private List<String> finalLanguages;
+        private List<String> finalLanguageFields;
+        private Map<String, FormProcessor.SectionInfo> formSectionMap;
+        private List<FormProcessor.FieldInfo> formFieldList;
+        private Map<String, Boolean> baseFieldsPresent;
+        private Map<String, Map<String, String>> translationMap;
+        private Map<String, Map<String, String>> fieldNamesAndOptionsMap;
+        private Boolean usesEsri;
+    }
+
+    private class SectionInfo implements Comparable {
+        private String titleId;
+        private String title;
+        private String name;
+        private List<FormProcessor.FieldInfo> fields;
+        private String baseRowClass;
+        private String sectionHeaderClass;
+        private String baseColClass;
+        private Boolean hidden;
+        private Integer sortOrder;
+
+        public Integer compareTo(Object compareTo) {
+            FormProcessor.SectionInfo compareToResult = (FormProcessor.SectionInfo) compareTo;
+            Integer s1 = (sortOrder==null) ? 0 : sortOrder;
+            Integer s2 = (compareToResult.sortOrder==null) ? 0 : compareToResult.sortOrder;
+            if(s1==s2) return 0;
+            if(s1>s2) return 1;
+            return -1;
+        }
+    }
+
+    private class FieldInfo implements Comparable {
+        Form_Field__c record;
+        private String objectName;
+        private String name;
+        private String label;
+        private String labelEng;
+        private String type;
+        private String originalType;
+        private String baseOptionLabel;
+        private String framework;
+        private Schema.SobjectField schema;
+        private List<FormProcessor.OptionInfo> options;
+        private String defaultValue;
+        private String baseColClass;
+        private String requiredString;
+        private List<String> excludeForLanguages;
+        private String formType;
+        private FormProcessor.YesNo yn;
+        private Integer sortOrder;
+        private Integer width;
+        private Boolean showAllOptions;
+        private Boolean hidden;
+        private Boolean required;
+        private Boolean valid;
+        private Boolean isSubscriptionField;
+
+        public Integer compareTo(Object compareTo) {
+            FormProcessor.FieldInfo compareToResult = (FormProcessor.FieldInfo) compareTo;
+            Integer s1 = (sortOrder==null) ? 0 : sortOrder;
+            Integer s2 = (compareToResult.sortOrder==null) ? 0 : compareToResult.sortOrder;
+            if(s1==s2) return 0;
+            if(s1>s2) return 1;
+            return -1;
+        }
+    }
+
+    public class OptionInfo {
+        public String translationId;
+        public String label;
+        public String value;
+        public String labelEng;
+        public Boolean isDefault;
+    }
+
+    private class YesNo {
+        private String Yes;
+        private String No;
+        private YesNo(String Y, String N) {
+            this.Yes = Y;
+            this.No = N;
+        }
+    }
+   
+    public class FormProcessorException extends Exception {
+    }
+}
