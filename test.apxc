@@ -1,0 +1,5 @@
+function testfunc(teststring,allFormsFinalLanguageFields,translationMapKeys){
+  //teststring = teststring.replace(/\{/, "{" + $decode + ";"); 
+String translationQuery = 'SELECT Id, Name, ' + String.join(allFormsFinalLanguageFields, ',') + 
+                                      ' FROM Form_Translation__c WHERE Id IN(\'' + String.join( translationMapKeys, '\',\'') + '\')'; 
+}
