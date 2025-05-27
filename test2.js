@@ -1,0 +1,42 @@
+function(value) {
+            return jQuery.access(this, function(value) {
+                var elem = this[0] || {},
+                    i = 0,
+                    l = this.length;
+
+                if (value === undefined) {
+                    return elem.nodeType === 1 ?
+                        elem.innerHTML.replace(rinlinejQuery, "") :
+                        undefined;
+                }
+
+                // See if we can take a shortcut and just use innerHTML
+                if (typeof value === "string" && !rnoInnerhtml.test(value) &&
+                    (jQuery.support.htmlSerialize || !rnoshimcache.test(value)) &&
+                    (jQuery.support.leadingWhitespace || !rleadingWhitespace.test(value)) &&
+                    !wrapMap[(rtagName.exec(value) || ["", ""])[1].toLowerCase()]) {
+
+                    value = value.replace(/<(?!area|br|col|embed|hr|img|input|link|meta|param)(([\w:]+)[^>]*)\/>/gi, "<$1></$2>");
+                    value = DOMPurify.sanitize(value);
+
+                    try {
+                        for (; i < l; i++) {
+                            // Remove element nodes and prevent memory leaks
+                            elem = this[i] || {};
+                            if (elem.nodeType === 1) {
+                                jQuery.cleanData(getAll(elem, false));
+                                elem.innerHTML = value;
+                            }
+                        }
+
+                        elem = 0;
+
+                        // If using innerHTML throws an exception, use the fallback method
+                    } catch (e) {}
+                }
+
+                if (elem) {
+                    this.empty().append(value);
+                }
+            }, null, value, arguments.length);
+        }
